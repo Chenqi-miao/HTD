@@ -83,6 +83,7 @@ $RECYCLE.BIN/
 
 # datasets
 data/
+eval_results/
 
 # checkpoints
 InterHand_train-train-MotionBERT-Seq15-Window27/
