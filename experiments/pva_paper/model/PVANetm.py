@@ -1,228 +1,161 @@
 """
-PVANet — Position-Velocity-Acceleration Network
-================================================
-遵循 HTD-Refine 论文架构（Sec 3.2, 图 3），适配手部 3D 关节输入。
+PVANet — Position-Velocity-Acceleration Network (Pure Temporal)
+===============================================================
+纯时序 Transformer + RoPE，每关节独立处理。
+
+问题定位: 之前 mean pool over J 丢失了关节信息，导致不收敛。
+修复: reshape [B, F, J, D] → [B*J, F, D] 保留 J 维度。
 
 架构:
-  3D 关节 [B, F, J, 3] → JointEmbed → [B, F, D]
-    → 8×TemporalTransformer(RoPE) → [B, F, D]
-      ├→ Position Head (MLP)         → [B, F, J, 3]
-      ├→ Velocity Decoder (conv→MLP)  → [B, F, J, 3]
-      └→ Accel Decoder   (conv→MLP)  → [B, F, J, 3]
+  [B, F, J, 3]
+    ↓ Joint Embed
+  [B, F, J, D]
+    ↓ reshape: J → batch
+  [B*J, F, D]
+    ↓ TemporalTransformer ×N (RoPE)
+  [B*J, F, D]
+    ↓ reshape back
+  [B, F, J, D]
+    ├→ Pos Head (per-joint Linear) → [B, F, J, 3]
+    ├→ Vel Head (per-joint Conv1d+MLP) → [B, F, J, 3]
+    └→ Acc Head (per-joint Conv1d+MLP) → [B, F, J, 3]
 """
 
 import torch
 import torch.nn as nn
 from einops import rearrange
-from temporal_transformer import TemporalTransformerDecoder as TemporalTransformer
+from model.temporal_transformer import TemporalTransformerDecoder
 from model.loss import SmoothNetLoss
 
 
-# ═══════════════════════════════════════════════════════════
-#  速度/加速度 Decoder（适配手部：去掉冗余 transformer）
-# ═══════════════════════════════════════════════════════════
-
 class MotionDecoder(nn.Module):
-    """
-    速度/加速度解码器（手部简化版）。
-    论文用 conv → pool → transformer → MLP，但我们的特征已经经过 8 层 transformer，
-    所以 MotionDecoder 内部不需要再套 transformer，conv + MLP 就够。
-
-    Args:
-        dim: 特征维度
-        num_joints: 关节数
-        out_dim: 输出维度（速度=3, 加速度=3）
-    """
-    def __init__(self, dim=256, num_joints=21, out_dim=3):
+    """速度/加速度解码器（每关节独立 Conv1d + MLP）"""
+    def __init__(self, dim=256, out_dim=3):
         super().__init__()
-        # Conv1d: 聚合局部时序信息（kernel=3）
         self.conv = nn.Conv1d(dim, dim, kernel_size=3, padding=1)
         self.norm = nn.LayerNorm(dim)
-        # 输出 MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Linear(dim, num_joints * out_dim),
+        self.head = nn.Sequential(
+            nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, out_dim),
         )
 
     def forward(self, x):
-        """
-        x: [B, F, dim]
-        returns: [B, F, J, out_dim]
-        """
-        B, F, C = x.shape
-        x = self.conv(x.permute(0, 2, 1)).permute(0, 2, 1)  # [B, F, dim]
+        B, F, J, C = x.shape
+        x = x.reshape(B * J, F, C).permute(0, 2, 1)   # [B*J, C, F]
+        x = self.conv(x).permute(0, 2, 1)               # [B*J, F, C]
         x = self.norm(x)
-        x = self.mlp(x)  # [B, F, J*3]
-        return x.reshape(B, F, -1, 3)  # [B, F, J, 3]
+        x = self.head(x)                                 # [B*J, F, 3]
+        return x.reshape(B, J, F, 3).permute(0, 2, 1, 3) # [B, F, J, 3]
 
-
-# ═══════════════════════════════════════════════════════════
-#  PVANet 主模型
-# ═══════════════════════════════════════════════════════════
 
 class PVANetModel(nn.Module):
-    """
-    PVA-Net: 位置-速度-加速度网络（手部关节版）
-    使用 temporal_transformer.py 中的 TemporalTransformer（带 RoPE）。
-
-    输入: [B, V, F, J, 3]
-    输出:
-      pos: [B, V, F, J, 3]  细化关节位置
-      vel: [B, V, F, J, 3]  关节速度
-      acc: [B, V, F, J, 3]  关节加速度
-    """
-
     def __init__(self,
                  num_frame=15,
                  num_joints=21,
                  dim_feat=256,
                  depth=8,
                  num_heads=8,
-                 dim_feedforward=1024,  # 4x 扩展比（适合 dim=256）
+                 ff_rate=4,
                  dropout=0.1,
-                 w_vel=0.1,
-                 w_accel=0.05):
+                 w_vel=0.05,
+                 w_accel=0.02):
         super().__init__()
         self.num_frame = num_frame
         self.num_joints = num_joints
-        self.dim_feat = dim_feat
         self.w_vel = w_vel
         self.w_accel = w_accel
 
-        # ─── Joint Embedding ─────────────────────────
+        # Joint Embed (保持 J 维)
         self.joint_embed = nn.Linear(3, dim_feat)
-        self.pos_dropout = nn.Dropout(dropout)
+        self.pos_drop = nn.Dropout(dropout)
 
-        # ─── 主时序 Transformer（8层, RoPE）─────────
-        self.temporal_transformer = TemporalTransformer(
-            dim=dim_feat,
-            depth=depth,
-            num_heads=num_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            max_len=num_frame,
+        # 纯时序 Transformer（J 维展进 batch）
+        self.temporal = TemporalTransformerDecoder(
+            dim=dim_feat, depth=depth, num_heads=num_heads,
+            mlp_ratio=ff_rate, drop_rate=dropout,
+            attn_drop_rate=dropout, use_rope=True,
         )
 
-        # ─── 三个预测头 ────────────────────────────────
-        self.pos_head = nn.Sequential(
-            nn.Linear(dim_feat, dim_feat),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feat, num_joints * 3),
-        )
+        # 三个预测头（每关节独立输出）
+        self.pos_head = nn.Linear(dim_feat, 3)
+        self.vel_head = MotionDecoder(dim=dim_feat)
+        self.acc_head = MotionDecoder(dim=dim_feat)
 
-        self.vel_head = MotionDecoder(
-            dim=dim_feat, num_joints=num_joints, out_dim=3,
-        )
-
-        self.acc_head = MotionDecoder(
-            dim=dim_feat, num_joints=num_joints, out_dim=3,
-        )
-
-        # ─── Loss ──────────────────────────────────────
+        # Loss
         self.sm_loss = SmoothNetLoss(w_accel=0.1, w_pos=1.0)
-        self.l1_loss = nn.L1Loss(reduction='none')
+        self.l1 = nn.L1Loss(reduction='none')
 
-        self._init_weights()
-        total = sum(p.numel() for p in self.parameters())
-        print(f'[PVANet] {depth} layers, {num_heads} heads, '
-              f'dim={dim_feat}, ffn={dim_feedforward}, params={total:,}')
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Conv1d):
-                nn.init.xavier_uniform_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    # ─── 辅助函数 ──────────────────────────────────────
-
-    @staticmethod
-    def compute_vel_accel(joints, mask):
-        """从 GT 计算速度/加速度目标。joints: [B,V,F,J,3], mask: [B,V,F,J]"""
-        B, V, F, J, _ = joints.shape
-        vel = joints[:, :, 1:, :, :] - joints[:, :, :-1, :, :]
-        vel = torch.cat([vel, vel[:, :, -1:, :, :]], dim=2)
-        acc = joints[:, :, 2:, :, :] - 2 * joints[:, :, 1:-1, :, :] + joints[:, :, :-2, :, :]
-        acc = torch.cat([acc, acc[:, :, -1:, :, :], acc[:, :, -1:, :, :]], dim=2)
-        vel_mask = mask[:, :, :-1, :] * mask[:, :, 1:, :]
-        vel_mask = torch.cat([vel_mask, vel_mask[:, :, -1:, :]], dim=2)
-        acc_mask = mask[:, :, :-2, :] * mask[:, :, 1:-1, :] * mask[:, :, 2:, :]
-        acc_mask = torch.cat([acc_mask, acc_mask[:, :, -1:, :], acc_mask[:, :, -1:, :]], dim=2)
-        return vel, acc, vel_mask.float(), acc_mask.float()
-
-    @staticmethod
-    def normalize(joints, center, in_val):
-        norm = 300
-        B, V, F, J, _ = joints.shape
-        sc = (center * in_val).sum(dim=2).sum(dim=2) / (in_val.sum(dim=2).sum(dim=2) + 1e-8)
-        return (joints - sc.reshape(B, V, 1, 1, 3)) / norm, sc.reshape(B, V, 1, 1, 3), norm
-
-    # ─── 前向 ──────────────────────────────────────────
+        p = sum(p.numel() for p in self.parameters())
+        print(f'[PVANet] depth={depth}, dim={dim_feat}, heads={num_heads}, ff={ff_rate}x, params={p:,}')
 
     def forward(self, inputs, targets, meta_info):
-        joints_in = inputs["joint_xyz"].cuda()
-        joints_gt = targets["joint_xyz"].cuda()
+        ji = inputs["joint_xyz"].cuda()
+        jg = targets["joint_xyz"].cuda()
         center = meta_info['center_xyz'].cuda()
-        in_val = meta_info['joint_in_val'].cuda().reshape(joints_in.shape[:4] + (1,))
-        continuous_val = meta_info['continuous_val'].cuda()
-        B, V, F, J, _ = joints_in.size()
+        iv = meta_info['joint_in_val'].cuda().reshape(ji.shape[:4] + (1,))
+        cv = meta_info['continuous_val'].cuda()
+        B, V, F, J = ji.shape[:4]
 
-        # 归一化
-        jn_in, sc, nv = self.normalize(joints_in, center, in_val)
-        jn_gt = (joints_gt - sc) / nv
+        # Normalize
+        norm = 300
+        sc = (center * iv).sum(dim=(2, 3)) / (iv.sum(dim=(2, 3)) + 1e-8)  # [B, V, 1]
+        sc = sc.reshape(B, V, 1, 1, 3)
+        jn_in = (ji - sc) / norm
+        jn_gt = (jg - sc) / norm
 
-        # Joint Embed → Temporal Transformer
-        j_flat = rearrange(jn_in, 'b v f j c -> (b v) f j c')      # [B*V, F, J, 3]
-        feat = self.joint_embed(j_flat).mean(dim=2)                 # [B*V, F, dim]
-        feat = self.pos_dropout(feat)
-        feat = self.temporal_transformer(feat)                      # [B*V, F, dim]
-        feat = rearrange(feat, '(b v) f c -> b v f c', b=B, v=V)   # [B, V, F, dim]
+        # Joint Embed → [B, V, F, J, D]
+        x = self.joint_embed(jn_in)
+        x = self.pos_drop(x)
 
-        # 三个预测头
-        jn_pred = self.pos_head(feat).reshape(B, V, F, J, 3)
-        f_main = feat[:, 0] if V == 1 else feat.mean(dim=1)        # [B, F, dim]
-        vel_pred = self.vel_head(f_main).unsqueeze(1)               # [B, 1, F, J, 3]
-        acc_pred = self.acc_head(f_main).unsqueeze(1)
+        # 展平 V, J → batch，过时序 Transformer
+        x = rearrange(x, 'b v f j d -> (b v j) f d')      # [B*V*J, F, D]
+        x = self.temporal(x)                                # [B*V*J, F, D]
+        x = rearrange(x, '(b v j) f d -> b v f j d',
+                      b=B, v=V, j=J)                      # [B, V, F, J, D]
+
+        # 三个头
+        jn_pred = self.pos_head(x)                         # [B, V, F, J, 3]
+        fm = x[:, 0] if V == 1 else x.mean(dim=1)          # [B, F, J, D]
+        vp = self.vel_head(fm).unsqueeze(1)                 # [B, 1, F, J, 3]
+        ap = self.acc_head(fm).unsqueeze(1)
         if V > 1:
-            vel_pred = vel_pred.repeat(1, V, 1, 1, 1)
-            acc_pred = acc_pred.repeat(1, V, 1, 1, 1)
+            vp = vp.repeat(1, V, 1, 1, 1)
+            ap = ap.repeat(1, V, 1, 1, 1)
 
-        j_pred = jn_pred * nv + sc
+        j_pred = jn_pred * norm + sc
 
         # Mask
-        val = (continuous_val.view(B, 1, F, 1, 1)
+        val = (cv.view(B, 1, F, 1, 1)
                * meta_info['joint_gt_val'].cuda().view(B, 1, F, J, 1))
-        val_V = val.repeat(1, V, 1, 1, 1)
-        val_VP = val.repeat(1, V, 1, 1, 3)
+        vV = val.repeat(1, V, 1, 1, 1)
+        vP = val.repeat(1, V, 1, 1, 3)
 
         if self.training:
-            pos_loss = self.sm_loss(
-                jn_pred.reshape(B * V, F, J * 3),
-                jn_gt.reshape(B * V, F, J * 3),
-                1 - val_VP.view(B * V, F, J * 3),
-            )
-            gt_vel, gt_acc, vm, am = self.compute_vel_accel(jn_gt, val_V[..., 0])
-            vel_loss = (self.l1_loss(vel_pred, gt_vel) * vm.unsqueeze(-1)).sum() / (vm.sum() + 1e-8)
-            accel_loss = (self.l1_loss(acc_pred, gt_acc) * am.unsqueeze(-1)).sum() / (am.sum() + 1e-8)
-            total = pos_loss + self.w_vel * vel_loss + self.w_accel * accel_loss
+            # 位置 loss
+            pl = self.sm_loss(jn_pred.reshape(B * V, F, J * 3),
+                              jn_gt.reshape(B * V, F, J * 3),
+                              1 - vP.view(B * V, F, J * 3))
 
-            init_err = self._calc_error(joints_in, joints_gt, val_V)
-            ref_err = self._calc_error(j_pred, joints_gt, val_V)
+            # 速度/加速度 loss
+            gv = jn_gt[:, :, 1:] - jn_gt[:, :, :-1]
+            gv = torch.cat([gv, gv[:, :, -1:]], dim=2)
+            ga = gv[:, :, 1:] - gv[:, :, :-1]
+            ga = torch.cat([ga, ga[:, :, -1:]], dim=2)
+            vm = (vV[..., :-1, :] * vV[..., 1:, :])
+            vm = torch.cat([vm, vm[:, :, -1:]], dim=2)
+            am = (vV[..., :-2, :] * vV[..., 1:-1, :] * vV[..., 2:, :])
+            am = torch.cat([am, am[:, :, -1:], am[:, :, -1:]], dim=2)
 
+            vl = (self.l1(vp, gv) * vm).sum() / (vm.sum() + 1e-8)
+            al = (self.l1(ap, ga) * am).sum() / (am.sum() + 1e-8)
+
+            total = pl + self.w_vel * vl + self.w_accel * al
             return {'pd_joint_xyz': j_pred}, \
-                   {'pos_loss': pos_loss, 'vel_loss': vel_loss,
-                    'accel_loss': accel_loss, 'total_loss': total}, \
-                   {'init': init_err, 'refine': ref_err}
+                   {'pos': pl, 'vel': vl, 'acc': al, 'total': total}, \
+                   {'init': self._ce(ji, jg, vV), 'refine': self._ce(j_pred, jg, vV)}
         else:
-            return {'pd_joint_xyz': j_pred, 'vel_pred': vel_pred, 'acc_pred': acc_pred}
+            return {'pd_joint_xyz': j_pred, 'vel_pred': vp, 'acc_pred': ap}
 
     @staticmethod
-    def _calc_error(joint, gt, val):
-        d = (joint * val - gt * val)
-        return torch.sqrt(torch.sum(d * d, dim=-1)).sum() / (val.sum() + 1e-8)
+    def _ce(j, g, v):
+        d = (j * v - g * v)
+        return torch.sqrt(torch.sum(d * d, dim=-1)).sum() / (v.sum() + 1e-8)
