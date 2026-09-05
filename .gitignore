@@ -89,3 +89,4 @@ eval_results/
 InterHand_train-train-MotionBERT-Seq15-Window27/
 checkpoint/
 runs/
+log/

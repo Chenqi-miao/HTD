@@ -1,0 +1,16 @@
+[Exp2_s30_att] depth=8, frames=31, params=7,520,009
+[eval_window] exp2_s30_att (exp2) W=31
+Loading Test data ...
+Loading Time：0:24
+  PCE GT 范围: v=[0.000,52.701] a=[0.000,43.081]
+  W=31 @142930 窗
+    mpjpe    : Input=  13.663  Model=  10.746
+    pa_mpjpe : Input=   7.037  Model=   7.191
+    mpjve    : Input=   4.354  Model=   2.409
+    mpjae    : Input=   6.738  Model=   2.623
+    corr_v   : Input=   0.579  Model=   0.705
+    corr_a   : Input=   0.329  Model=   0.462
+    ratio_v  : Input=   1.177  Model=   0.695
+    ratio_a  : Input=   1.707  Model=   0.486
+    highfreq : Input=   0.322  Model=   0.262
+  报告已存: /home/pfren/pycharm/HTD/experiments/exp2_s30_att/eval_W31.json

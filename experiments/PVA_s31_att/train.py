@@ -1,0 +1,183 @@
+import os, sys, argparse, importlib.util, torch, numpy as np
+from tqdm import tqdm
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "..", ".."))
+sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "model"))
+
+def setup_logger(name, logfile):
+    import logging
+    logger = logging.getLogger(name); logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(logfile, mode='a')
+    fh.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%m/%d %H:%M:%S'))
+    logger.addHandler(fh)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S'))
+    logger.addHandler(sh)
+    return logger
+
+def set_seed(s=42):
+    import random; random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+def seed_worker(w):
+    np.random.seed(torch.initial_seed() % 2**32)
+
+def jerk_mag(p, m):
+    v = p[1:] - p[:-1]; a = v[1:] - v[:-1]; j = a[1:] - a[:-1]
+    jm = m[:-3] * m[1:-2] * m[2:-1] * m[3:]
+    return (np.linalg.norm(j, axis=-1) * jm).sum() / (jm.sum() + 1e-8)
+
+def mpjpe(p, g, m):
+    e = np.sqrt(((p - g) ** 2).sum(-1))
+    return (e * m).sum() / (m.sum() + 1e-8)
+
+def mpjve(p, g, m):
+    vp = p[1:] - p[:-1]; vg = g[1:] - g[:-1]
+    vm = m[:-1] * m[1:]
+    e = np.sqrt(((vp - vg) ** 2).sum(-1))
+    return (e * vm).sum() / (vm.sum() + 1e-8)
+
+def mpjae(p, g, m):
+    vp = p[1:] - p[:-1]; vg = g[1:] - g[:-1]
+    ap = vp[1:] - vp[:-1]; ag = vg[1:] - vg[:-1]
+    am = m[:-2] * m[1:-1] * m[2:]
+    e = np.sqrt(((ap - ag) ** 2).sum(-1))
+    return (e * am).sum() / (am.sum() + 1e-8)
+
+def evaluate(model, test_loader, cfg):
+    model.eval()
+    jit_list = []
+    acc = {k: {"mpjpe": [], "mpjve": [], "mpjae": []} for k in ["input", "model"]}
+    with torch.no_grad():
+        for inp, tgt, meta in tqdm(test_loader, desc="Eval", leave=False):
+            B, V, F, J = inp["joint_xyz"].shape[:4]
+            ji = inp["joint_xyz"].numpy()[:, 0]
+            gj = tgt["joint_xyz"].numpy()[:, 0]
+            o = model(inp, tgt, meta)
+            pj = o["pd_joint_xyz"].cpu().numpy()[:, 0]
+            cv = meta["continuous_val"].numpy().reshape(B, -1)
+            gv = meta["joint_gt_val"].numpy()[:, 0]
+            msk = (cv[:, :, None] * gv)
+            for b in range(B):
+                m = msk[b]
+                jit_list.append(jerk_mag(ji[b], m))
+                acc["model"]["mpjpe"].append(mpjpe(pj[b], gj[b], m))
+                acc["model"]["mpjve"].append(mpjve(pj[b], gj[b], m))
+                acc["model"]["mpjae"].append(mpjae(pj[b], gj[b], m))
+                acc["input"]["mpjpe"].append(mpjpe(ji[b], gj[b], m))
+                acc["input"]["mpjve"].append(mpjve(ji[b], gj[b], m))
+                acc["input"]["mpjae"].append(mpjae(ji[b], gj[b], m))
+    model.train()
+    jit = np.array(jit_list)
+    q1, q2 = np.percentile(jit, [33.3, 66.7])
+    out = {"input": {k: float(np.mean(acc["input"][k])) for k in ["mpjpe", "mpjve", "mpjae"]},
+           "model": {k: float(np.mean(acc["model"][k])) for k in ["mpjpe", "mpjve", "mpjae"]},
+           "n": len(jit)}
+    mp = np.array(acc["model"]["mpjpe"])
+    for lbl, lo, hi in [("低", -np.inf, q1), ("中", q1, q2), ("高", q2, np.inf)]:
+        sel = (jit >= lo) & (jit < hi)
+        out[lbl] = {"n": int(sel.sum()), "jit": float(jit[sel].mean()), "mpjpe": float(mp[sel].mean())}
+    return out
+
+def main():
+    parser = argparse.ArgumentParser(); parser.add_argument('--resume', default='')
+    args = parser.parse_args()
+    exp_dir = PROJECT_ROOT; exp_name = os.path.basename(exp_dir)
+    spec = importlib.util.spec_from_file_location("exp_config", os.path.join(exp_dir, "config.py"))
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    cfg = mod.Config(); cfg.exp_dir = exp_dir
+    for d2 in ['checkpoint', 'log', 'vis']: os.makedirs(os.path.join(exp_dir, d2), exist_ok=True)
+
+    set_seed(42)
+    logger = setup_logger(exp_name, os.path.join(exp_dir, "log", f"train_{exp_name}.log"))
+    writer = SummaryWriter(os.path.join(exp_dir, "log"))
+
+    from model.net import Net
+    model = Net(num_frame=cfg.seq_len, num_joints=cfg.joint_num,
+                dim_feat=cfg.dim_feat, depth=cfg.transformer_depth,
+                w_vel=cfg.w_vel, w_accel=cfg.w_accel).cuda()
+    # ==== HYBRID temporal: LRU + Transformer, best config ====
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(exp_dir))          # experiments/ (simple_temporal)
+    _sys.path.insert(0, os.path.join(exp_dir, "model"))    # temporal_transformer / loss
+    from simple_temporal import LRUTransformer
+    model.temporal = LRUTransformer(dim=cfg.dim_feat, depth=8).cuda()
+    import torch.nn as _nn
+    from loss import SmoothNetLoss
+    model.joint_attn_pre = _nn.Identity()      # 最优配置: 去 pre 空间注意力
+    model.sm_loss = SmoothNetLoss(0.0, 1.0)    # 最优配置: 去 SmoothNetLoss 加速度项
+    total_p = sum(p.numel() for p in model.parameters())
+    logger.info(f"[HYBRID] LRUTransformer(depth=8) + no_attn_pre + nosmacc | params={total_p:,}")
+    opt = optim.AdamW(model.parameters(), lr=cfg.lr)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.total_epoch, eta_min=0)
+    start_epoch = 0
+    if cfg.pretrained and os.path.isfile(cfg.pretrained):
+        ck = torch.load(cfg.pretrained, map_location="cuda")
+        sd = ck["net"] if "net" in ck else ck
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        logger.info(f"已加载预训练 exp2 (strict=False). missing={len(missing)} unexpected={len(unexpected)}")
+        logger.info(f"  missing 前几个: {list(missing)[:5]}")
+    if args.resume:
+        ck = torch.load(args.resume)
+        model.load_state_dict(ck["net"]); opt.load_state_dict(ck["optimizer"])
+        sched.load_state_dict(ck["schedule"]); start_epoch = ck["last_epoch"] + 1
+
+    from dataset.seqhand import SeqHand, SeqHandTest
+    g = torch.Generator().manual_seed(42)
+    train_ds = SeqHand(cfg.data_dir, cfg.data_list, min_seq_len=cfg.min_seq_len,
+                        seq_len=cfg.seq_len, view_num=cfg.view_num, data_num=cfg.data_num)
+    train_ld = DataLoader(train_ds, cfg.batch_size, num_workers=cfg.num_worker,
+                          worker_init_fn=seed_worker, generator=g, shuffle=True, drop_last=True)
+    test_ds = SeqHandTest(cfg.data_dir, cfg.test_list, min_seq_len=cfg.min_seq_len,
+                          seq_len=cfg.seq_len, view_num=cfg.view_num, data_num=cfg.test_data_num)
+    test_ld = DataLoader(test_ds, cfg.batch_size, shuffle=False, num_workers=cfg.num_worker)
+
+    total_p = sum(p.numel() for p in model.parameters())
+    logger.info(f'{exp_name} | params={total_p:,} seq_len={cfg.seq_len} '
+                f'max_batch={cfg.max_batches_per_epoch}')
+
+    min_err = 1e9
+    for epoch in range(start_epoch, cfg.total_epoch):
+        model.train(); losses = []
+        pbar = tqdm(train_ld, desc=f"Epoch {epoch:2d}/{cfg.total_epoch}")
+        for iteration, (inp, tgt, meta) in enumerate(pbar):
+            if iteration >= cfg.max_batches_per_epoch:
+                break
+            opt.zero_grad()
+            o, l, e = model(inp, tgt, meta)
+            l["total"].backward(); opt.step()
+            writer.add_scalar("train/loss", l["total"].item(), epoch * cfg.max_batches_per_epoch + iteration)
+            losses.append(l["total"].item())
+            if iteration % cfg.print_iter == 0:
+                pbar.set_postfix({"loss": f"{l['total'].item():.4f}"})
+        sched.step()
+        logger.info(f"Epoch {epoch:2d} | loss={np.mean(losses):.4f} | lr={sched.get_last_lr()[0]:.2e}")
+        torch.save({"net": model.state_dict(), "optimizer": opt.state_dict(),
+                     "schedule": sched.state_dict(), "last_epoch": epoch},
+                    os.path.join(exp_dir, "checkpoint", "latest.pth"))
+        if cfg.loader_resample and hasattr(train_ds, "generator_seq"):
+            train_ds.generator_seq()
+        if epoch % cfg.eval_interval == 0:
+            ev = evaluate(model, test_ld, cfg)
+            i, mo = ev["input"], ev["model"]
+            imp = lambda a, b: (1 - b / (a + 1e-8)) * 100
+            logger.info(f"  ── 位置 ──  Input MPJPE={i['mpjpe']:.4f} → Model={mo['mpjpe']:.4f} ({imp(i['mpjpe'], mo['mpjpe']):+.1f}%)")
+            logger.info(f"  ── 速度 ──  Input MPJVE={i['mpjve']:.4f} → Model={mo['mpjve']:.4f} ({imp(i['mpjve'], mo['mpjve']):+.1f}%)")
+            logger.info(f"  ── 加速度 ── Input MPJAE={i['mpjae']:.4f} → Model={mo['mpjae']:.4f} ({imp(i['mpjae'], mo['mpjae']):+.1f}%)")
+            logger.info(f"  抖动分桶 Model MPJPE: 低({ev['低']['mpjpe']:.3f}) "
+                        f"中({ev['中']['mpjpe']:.3f}) 高({ev['高']['mpjpe']:.3f})")
+            if mo["mpjpe"] < min_err:
+                min_err = mo["mpjpe"]
+                torch.save({"net": model.state_dict(), "optimizer": opt.state_dict(),
+                             "schedule": sched.state_dict(), "last_epoch": epoch},
+                            os.path.join(exp_dir, "checkpoint", "best.pth"))
+                logger.info(f"  -> Best: {min_err:.4f}")
+
+    logger.info(f"Done! Best={min_err:.4f}")
+
+if __name__ == "__main__":
+    main()

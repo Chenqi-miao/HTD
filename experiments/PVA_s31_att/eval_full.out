@@ -1,0 +1,12 @@
+[Exp2_s30_att] depth=8, frames=31, params=7,520,009
+[eval_model] exp2_s30_att (exp2) seq_len=31 ckpt=checkpoint/best_orig_full.pth
+Loading Test data ...
+Loading Time：0:24
+  exp2_s30_att @142930 窗
+    mpjpe    : Input=  13.663  Model=  10.746
+    pa_mpjpe : Input=   7.037  Model=   7.191
+    mpjve    : Input=   4.336  Model=   2.397
+    mpjae    : Input=   6.687  Model=   2.596
+    corr_v   : Input=   0.579  Model=   0.705
+    corr_a   : Input=   0.329  Model=   0.462
+  报告: /home/pfren/pycharm/HTD/experiments/exp2_s30_att/eval_report.json
